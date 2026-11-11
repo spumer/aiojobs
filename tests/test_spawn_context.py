@@ -4,8 +4,9 @@ import gc
 import inspect
 import sys
 import warnings
+import weakref
 from collections.abc import Awaitable, Coroutine
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from unittest import mock
 
 import pytest
@@ -13,6 +14,10 @@ import pytest
 from aiojobs import Scheduler
 
 _MakeScheduler = Callable[..., Awaitable[Scheduler]]
+
+
+class Payload:
+    """Weak-referenceable holder for context variable values."""
 
 
 async def test__immediate_job__keeps_spawn_context_after_await(
@@ -83,6 +88,35 @@ async def test__blocked_spawn__captures_context_before_queue_wait(
     assert await queued.wait() == "unset"
     third = await submitter
     assert await third.wait() == "before-wait"
+
+
+async def test__completed_job__releases_spawn_context(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    value: contextvars.ContextVar[Optional[Payload]] = contextvars.ContextVar(
+        "value", default=None
+    )
+    release = asyncio.Event()
+
+    async def blocker() -> None:
+        await release.wait()
+
+    async def work() -> None:
+        value.set(None)
+
+    first = await scheduler.spawn(blocker())
+    payload = Payload()
+    ref = weakref.ref(payload)
+    value.set(payload)
+    job = await scheduler.spawn(work())
+    value.set(None)
+    del payload
+    release.set()
+    await first.wait()
+    await job.wait()
+    gc.collect()
+    assert ref() is None
 
 
 async def test__cancelled_blocked_spawn__closes_its_coroutine(
@@ -209,28 +243,32 @@ async def test__active_before_first_step__closes_original_coroutine(
 @pytest.mark.skipif(
     sys.version_info < (3, 11), reason="create_task(context=...) requires Python 3.11"
 )
-async def test__default_factory__receives_captured_context_without_copy(
+async def test__default_factory__receives_captured_context(
     scheduler: Scheduler,
 ) -> None:
     loop = asyncio.get_running_loop()
     assert loop.get_task_factory() is None
+    value = contextvars.ContextVar("value", default="unset")
 
-    async def work() -> None:
-        await asyncio.sleep(0)
+    async def work() -> str:
+        return value.get()
 
     coro = work()
     with mock.patch.object(loop, "create_task", wraps=loop.create_task) as create_task:
         with mock.patch(
             "aiojobs._job.asyncio.create_task", wraps=asyncio.create_task
         ) as module_create_task:
+            value.set("submitted")
             job = await scheduler.spawn(coro)
         calls = [call for call in create_task.call_args_list if call.args[0] is coro]
         assert len(calls) == 1
-        assert calls[0].kwargs.get("context") is job._context
+        context = calls[0].kwargs.get("context")
+        assert context is not None
+        assert context.run(value.get) == "submitted"
         assert not [
             call for call in module_create_task.call_args_list if call.args[0] is coro
         ]
-    await job.wait()
+    assert await job.wait() == "submitted"
 
 
 async def test__legacy_factory__does_not_require_context_keyword(
@@ -245,7 +283,7 @@ async def test__legacy_factory__does_not_require_context_keyword(
         loop: asyncio.AbstractEventLoop,
         coro: Coroutine[Any, Any, Any],
         *,
-        name: str | None = None,
+        name: Optional[str] = None,
     ) -> asyncio.Task[Any]:
         if coro is job_coro:
             seen.append(value.get())
@@ -303,6 +341,76 @@ async def test__custom_factory__creates_one_job_task_with_spawn_context(
         assert await job.wait() == "spawn"
         assert [context for task, context in created if task is job._task] == ["spawn"]
         assert sum(task is job._task for task, _ in created) == 1
+    finally:
+        loop.set_task_factory(original)
+
+
+async def test__custom_factory__queued_job_keeps_spawn_context(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    loop = asyncio.get_running_loop()
+    original = loop.get_task_factory()
+    value = contextvars.ContextVar("value", default="unset")
+    release = asyncio.Event()
+    created = []
+
+    def factory(
+        loop: asyncio.AbstractEventLoop,
+        coro: Coroutine[Any, Any, Any],
+        **kwargs: Any,
+    ) -> asyncio.Task[Any]:
+        task = asyncio.Task(coro, loop=loop, **kwargs)
+        created.append((task, value.get()))
+        return task
+
+    async def blocker() -> None:
+        await release.wait()
+
+    async def work() -> str:
+        return value.get()
+
+    loop.set_task_factory(factory)  # type: ignore[arg-type]
+    try:
+        first = await scheduler.spawn(blocker())
+        value.set("queued")
+        job = await scheduler.spawn(work())
+        value.set("releaser")
+        release.set()
+        await first.wait()
+        assert await job.wait() == "queued"
+        assert [ctx for task, ctx in created if task is job._task] == ["queued"]
+    finally:
+        loop.set_task_factory(original)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="eager_task_factory requires Python 3.12"
+)
+async def test__eager_factory__queued_job_runs_in_spawn_context(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    loop = asyncio.get_running_loop()
+    original = loop.get_task_factory()
+    value = contextvars.ContextVar("value", default="unset")
+    release = asyncio.Event()
+
+    async def blocker() -> None:
+        await release.wait()
+
+    async def work() -> str:
+        return value.get()
+
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        first = await scheduler.spawn(blocker())
+        value.set("queued")
+        job = await scheduler.spawn(work())
+        value.set("releaser")
+        release.set()
+        await first.wait()
+        assert await job.wait() == "queued"
     finally:
         loop.set_task_factory(original)
 

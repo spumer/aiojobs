@@ -38,7 +38,7 @@ class Job(Generic[_T]):
         name: Optional[str] = None,
     ):
         self._coro = coro
-        self._context = contextvars.copy_context()
+        self._context: Optional[contextvars.Context] = contextvars.copy_context()
         self._scheduler: Optional[Scheduler] = scheduler
         self._name = name
         loop = asyncio.get_running_loop()
@@ -178,14 +178,15 @@ class Job(Generic[_T]):
     def _start(self) -> None:
         assert self._task is None
         loop = asyncio.get_running_loop()
+        context = self._context
+        assert context is not None  # _start runs once per job.
         if sys.version_info >= (3, 11) and loop.get_task_factory() is None:
-            self._task = loop.create_task(
-                self._coro, name=self._name, context=self._context
-            )
+            self._task = loop.create_task(self._coro, name=self._name, context=context)
         else:
-            self._task = self._context.run(
-                loop.create_task, self._coro, name=self._name
-            )
+            self._task = context.run(loop.create_task, self._coro, name=self._name)
+        # The task owns the context from here on; dropping the reference
+        # lets a finished job release spawn-time context variable values.
+        self._context = None
         self._task.add_done_callback(self._done_callback)
         self._started.set_result(None)
 
